@@ -110,6 +110,7 @@ Le Makefile assemble (`payload.asm`), compile la ressource (`payload.rc`) et lâ€
 [DEBUG] Injection succeeded for notepad.exe (PID=1234)
 [DEBUG] Fin injector.exe
 ```
+![image](https://github.com/user-attachments/assets/16a03478-47d7-4531-8875-99ecb27a9389)
 
 ---
 
