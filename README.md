@@ -138,7 +138,7 @@ Le Makefile assemble (`payload.asm`), compile la ressource (`payload.rc`) et lâ€
         [Read the Blog](https://whereisr0da.github.io/blog/posts/2020-10-21-inject-code/)
 
   Writing a File Infector/Encrypter: PE File Modification/Section ... | CodeReversing
-        Explains how to write content into a PE file and add new sections. The post is accompanied by source code and explanations for building a file infector, which is directly relevant to your project.
+        Explains how to write content into a PE file and add new sections. The post is accompanied by source code and explanations for building a file infector.
         [Read the Article](https://www.codereversing.com/archives/92)
 
   GitHub - secrary/InfectPE
