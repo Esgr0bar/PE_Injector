@@ -151,11 +151,6 @@ Simple MessageBox CreateRemoteThread injection (x64)
 https://github.com/stephenfewer/ReflectiveDLLInjection (référence globale)
 https://github.com/bats3c/BadAssMacros (macro -> injection, intéressant pour RVA)
 
-Calcul d’adresse distante par RVA (exemples)
-https://stackoverflow.com/questions/4571456/getprocaddress-on-a-remote-process
-
-Virus PE “Hello World” (patch EP + saut EP original)
-https://github.com/guitmz/pe-infect (exemple)
 
 Docs Microsoft / Références officielles
 
