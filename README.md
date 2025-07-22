@@ -121,3 +121,65 @@ Le Makefile assemble (`payload.asm`), compile la ressource (`payload.rc`) et l�
 * **Packing / Chiffrement** : non implémenté (stub en clair dans la section `.yarna`).
 
 ---
+
+
+## Sources / Articles
+
+  GitHub - Silva97/pei
+        A command-line tool for injecting code and manipulating PE32 (32-bit) and PE32+ (64-bit) executables. It allows for section manipulation and editing header fields, which is very similar to your described functionality.
+        [View on GitHub](https://github.com/secrary/InfectPE)
+
+  Backdooring PE Files with Shellcode | Red Team Notes
+        This article covers adding a new section to a PE file and injecting shellcode, including steps for making the section writable/executable. While not specifically about MessageBoxA, it covers the process of infection and code injection.
+        [Read the Article](https://www.ired.team/offensive-security/code-injection-process-injection/backdooring-portable-executables-pe-with-shellcode)
+
+  How to inject code into PE executables | r0da's Blog
+        A technical blog explaining various methods to inject code into PE files, including import manipulation and entrypoint alteration.
+        [Read the Blog](https://whereisr0da.github.io/blog/posts/2020-10-21-inject-code/)
+
+  Writing a File Infector/Encrypter: PE File Modification/Section ... | CodeReversing
+        Explains how to write content into a PE file and add new sections. The post is accompanied by source code and explanations for building a file infector, which is directly relevant to your project.
+        [Read the Article](https://www.codereversing.com/archives/92)
+
+  GitHub - secrary/InfectPE
+        A project that creates a new section (named ".infect") and injects custom code into PE files. It demonstrates disabling ASLR and NX, and provides technical details along with a VS project for analysis.
+        [View on GitHub](https://github.com/secrary/InfectPE)
+
+Simple MessageBox CreateRemoteThread injection (x64)
+https://github.com/stephenfewer/ReflectiveDLLInjection (référence globale)
+https://github.com/bats3c/BadAssMacros (macro -> injection, intéressant pour RVA)
+
+Calcul d’adresse distante par RVA (exemples)
+https://stackoverflow.com/questions/4571456/getprocaddress-on-a-remote-process
+
+Virus PE “Hello World” (patch EP + saut EP original)
+https://github.com/guitmz/pe-infect (exemple)
+
+Docs Microsoft / Références officielles
+
+  VirtualAllocEx
+    https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-virtualallocex
+
+  WriteProcessMemory
+    https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-writeprocessmemory
+
+  CreateRemoteThread
+    https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createremotethread
+
+  ProcessIdToSessionId
+    https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-processidtosessionid
+
+  Tool Help Functions (CreateToolhelp32Snapshot, Process32First/Next, Module32First/Next)
+    https://learn.microsoft.com/windows/win32/api/tlhelp32/
+
+  Portable Executable (PE/COFF) Specification
+    https://learn.microsoft.com/windows/win32/debug/pe-format
+
+  Resource Files & RC.exe
+    https://learn.microsoft.com/windows/win32/menurc/resource-files
+
+  MessageBoxA
+    https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-messageboxa
+
+
+---
