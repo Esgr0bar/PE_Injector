@@ -126,7 +126,7 @@ Le Makefile assemble (`payload.asm`), compile la ressource (`payload.rc`) et lâ€
 ## Sources / Articles
 
   GitHub - Silva97/pei
-        A command-line tool for injecting code and manipulating PE32 (32-bit) and PE32+ (64-bit) executables. It allows for section manipulation and editing header fields, which is very similar to your described functionality.
+        A command-line tool for injecting code and manipulating PE32 (32-bit) and PE32+ (64-bit) executables. It allows for section manipulation and editing header fields.
         [View on GitHub](https://github.com/secrary/InfectPE)
 
   Backdooring PE Files with Shellcode | Red Team Notes
