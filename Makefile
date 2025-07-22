@@ -11,6 +11,9 @@ CFLAGS     = -Wall -O2 -DWIN64 -m64
 LDFLAGS    = -luser32 -lkernel32 -static-libgcc
 NASMFLAGS  = -f win64
 
+# UPX packing options
+UPX_FLAGS  = --best --lzma
+
 TARGET     = injector.exe
 TARGET_UPX = injector_packed.exe
 
@@ -30,12 +33,22 @@ $(TARGET): injector.c payload.res
 
 # Pack the executable with UPX
 $(TARGET_UPX): $(TARGET)
-	$(UPX) --best --lzma -o $(TARGET_UPX) $(TARGET)
+	$(UPX) $(UPX_FLAGS) -o $(TARGET_UPX) $(TARGET)
 
 # Build unpacked version only
 unpacked: $(TARGET)
 
-clean:
-	-rm -f payload.bin payload.res $(TARGET) $(TARGET_UPX)
+# Pack existing executable with different compression levels
+pack-fast: $(TARGET)
+	$(UPX) --fast -o injector_fast.exe $(TARGET)
 
-.PHONY: all clean unpacked
+pack-best: $(TARGET)
+	$(UPX) --best -o injector_best.exe $(TARGET)
+
+pack-ultra: $(TARGET)
+	$(UPX) --ultra-brute -o injector_ultra.exe $(TARGET)
+
+clean:
+	-rm -f payload.bin payload.res $(TARGET) $(TARGET_UPX) injector_*.exe
+
+.PHONY: all clean unpacked pack-fast pack-best pack-ultra

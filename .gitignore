@@ -1,0 +1,15 @@
+# Build artifacts
+*.exe
+*.bin
+*.res
+*.obj
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE files
+.vscode/
+.vs/
+*.sln
+*.vcxproj*
