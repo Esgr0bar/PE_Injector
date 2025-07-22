@@ -1,36 +1,54 @@
-# Makefile pour injector (Windows x64)
+# Makefile for PE injector (cross-compilation to Windows x64)
 
+# Cross-compilation tools for Windows targets
 NASM       = nasm
-RC         = rc
-CC         = cl
-LINK       = link
+WINDRES    = x86_64-w64-mingw32-windres
+CC         = x86_64-w64-mingw32-gcc
+UPX        = upx
 
-# Compiler flags for x64
-CFLAGS     = /W4 /O2 /MT /DWIN64 user32.lib
-LDFLAGS    = /SUBSYSTEM:CONSOLE /MACHINE:X64
+# Compiler flags for x64 Windows
+CFLAGS     = -Wall -O2 -DWIN64 -m64
+LDFLAGS    = -luser32 -lkernel32 -static-libgcc
+NASMFLAGS  = -f win64
 
-RESFLAGS   = /fo
+# UPX packing options
+UPX_FLAGS  = --best --lzma
+
 TARGET     = injector.exe
+TARGET_UPX = injector_packed.exe
 
-all: $(TARGET)
+all: $(TARGET_UPX)
 
-#    Use "-f win64" so NASM generates 64-bit code, not flat DOS .COM
+# Use "-f win64" so NASM generates 64-bit Windows code
 payload.bin: payload.asm
-	$(NASM) -f win64 payload.asm -o payload.bin
+	$(NASM) $(NASMFLAGS) payload.asm -o payload.bin
 
-#  Wrap payload.bin into an RCDATA resource (ID 101)
+# Wrap payload.bin into an RCDATA resource (ID 101) using windres
 payload.res: payload.rc payload.bin
-	$(RC) $(RESFLAGS) payload.res payload.rc
+	$(WINDRES) payload.rc -O coff -o payload.res
 
-#  Compile + link injector.c with the .res
-#    We pass /DWIN64 so your code can #ifdef any 64-bit only branches if needed
+# Compile + link injector.c with the .res for Windows x64
 $(TARGET): injector.c payload.res
-	$(CC) $(CFLAGS) injector.c payload.res /link $(LDFLAGS)
+	$(CC) $(CFLAGS) injector.c payload.res -o $(TARGET) $(LDFLAGS)
+
+# Pack the executable with UPX
+$(TARGET_UPX): $(TARGET)
+	$(UPX) $(UPX_FLAGS) -o $(TARGET_UPX) $(TARGET)
+
+# Build unpacked version only
+unpacked: $(TARGET)
+
+# Pack existing executable with different compression levels
+pack-fast: $(TARGET)
+	$(UPX) --fast -o injector_fast.exe $(TARGET)
+
+pack-best: $(TARGET)
+	$(UPX) --best -o injector_best.exe $(TARGET)
+
+pack-ultra: $(TARGET)
+	$(UPX) --ultra-brute -o injector_ultra.exe $(TARGET)
 
 clean:
-	-@if exist payload.bin del payload.bin
-	-@if exist payload.res del payload.res
-	-@if exist injector.obj del injector.obj
-	-@if exist injector.exe del injector.exe
+	-rm -f payload.bin payload.res $(TARGET) $(TARGET_UPX) injector_*.exe
 
-.PHONY: all clean
+.PHONY: all clean unpacked pack-fast pack-best pack-ultra

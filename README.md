@@ -99,6 +99,50 @@ Le Makefile assemble (`payload.asm`), compile la ressource (`payload.rc`) et l�
 
 ---
 
+## 📦 UPX Packing (Nouveau)
+
+Le projet inclut maintenant la compression UPX pour réduire considérablement la taille des exécutables :
+
+### Cross-compilation sous Linux (recommandée)
+
+```bash
+# Installation des dépendances (Ubuntu/Debian)
+sudo apt install nasm upx-ucl mingw-w64
+
+cd PE_Injector
+
+# Compilation avec UPX packing (par défaut)
+make
+
+# Options de compression disponibles
+make unpacked           # Version non-compressée (265 KB)
+make pack-fast          # Compression rapide (~154 KB)
+make pack-best          # Compression optimale (~142 KB)  
+make pack-ultra         # Compression maximale (~130 KB)
+make                    # Compression par défaut --best --lzma (~131 KB)
+
+# Nettoyage
+make clean
+```
+
+### Comparaison des tailles d'exécutables
+
+| Cible | Taille | Réduction | Algorithme |
+|-------|--------|-----------|------------|
+| `injector.exe` | 265 464 bytes | - | Non-compressé |
+| `injector_packed.exe` | 130 808 bytes | 49% | `--best --lzma` |
+| `injector_ultra.exe` | 130 296 bytes | 51% | `--ultra-brute` |
+| `injector_best.exe` | 142 072 bytes | 46% | `--best` |
+| `injector_fast.exe` | 153 848 bytes | 42% | `--fast` |
+
+### Avantages du packing UPX
+
+- **Réduction de taille** : Jusqu'à 51% de compression
+- **Exécution directe** : L'exécutable se décompresse automatiquement en mémoire
+- **Compatibilité** : Fonctionne sur toutes les versions de Windows x64
+- **Performances** : Impact négligeable sur les performances à l'exécution
+---
+
 ## 🚀 Usage
 
 ```bat
