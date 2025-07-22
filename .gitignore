@@ -1,0 +1,13 @@
+# Build artifacts
+*.exe
+*.obj
+*.res
+*.bin
+payload_encoded.bin
+encoded_payload.h
+
+# Temporary files
+test_xor*
+verify_decode*
+bin_to_array.py
+xor_encoder
