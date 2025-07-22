@@ -162,7 +162,7 @@ make clean
 
 * **Injection dynamique** : à chaque exécution, tous les PE/64-bits sont infectés.
 * **Injection process** : `notepad.exe` est automatiquement ciblé.
-* **Packing / Chiffrement** : non implémenté (stub en clair dans la section `.yarna`).
+* **Packing / Chiffrement** :  implémenté (stub en xoré dans la section `.yarna`) et packing via upx.
 
 ---
 
