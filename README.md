@@ -141,6 +141,11 @@ Le Makefile assemble (`payload.asm`), compile la ressource (`payload.rc`) et l�
         Explains how to write content into a PE file and add new sections. The post is accompanied by source code and explanations for building a file infector.
         [Read the Article](https://www.codereversing.com/archives/92)
 
+ GitHub - secrary/InfectPE
+
+  A project that creates a new section (named ".infect") and injects custom code into PE files. It demonstrates disabling ASLR and NX, and provides technical details along with a VS project for analysis.
+    [View on GitHub](https://github.com/secrary/InfectPE)
+
 
 Simple MessageBox CreateRemoteThread injection (x64)
 https://github.com/stephenfewer/ReflectiveDLLInjection (référence globale)
