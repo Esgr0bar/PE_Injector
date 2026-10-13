@@ -27,6 +27,7 @@ Il réalise :
 | **Injection process**  | Recherche et infecte `notepad.exe` en mémoire (session courante)                        |
 | **MessageBox visible** | Le stub assembleur affiche un message ("pwnme 2600" par défaut)                         |
 | **Build conditionnel** | Compilation x64 uniquement (NASM + MSVC). Non supporté en 32-bits sans adaptation.      |
+| **Techniques**         | `crt` (CreateRemoteThread), `apc` (QueueUserAPC), `syscall` (Nt* memory ops)            |
 
 > ⚠️ **Limitation** : l’injecteur cible uniquement les applications 64-bits de la même session et du même niveau d’intégrité.
 
@@ -153,6 +154,14 @@ make clean
 [DEBUG] Found notepad.exe (PID=1234), injecting…
 [DEBUG] Injection succeeded for notepad.exe (PID=1234)
 [DEBUG] Fin injector.exe
+```
+
+Options utiles :
+
+```bat
+> injector.exe --technique apc
+> injector.exe --technique syscall
+> injector.exe --section   remplace l'infection par code cave par l'ajout d'une section
 ```
 ![image](https://github.com/user-attachments/assets/16a03478-47d7-4531-8875-99ecb27a9389)
 

